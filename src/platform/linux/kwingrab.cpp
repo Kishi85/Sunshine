@@ -32,7 +32,6 @@
 // local includes
 #include "cuda.h"
 #include "graphics.h"
-#include "kde-output-order-v1.h"
 #include "pipewire.cpp"
 #include "src/platform/common.h"
 #include "src/video.h"
@@ -172,9 +171,9 @@ namespace kwin {
     screencast_t &operator=(screencast_t &&) = delete;  // Do not allow to copying
 
     ~screencast_t() {
-      if (stream) {
-        zkde_screencast_stream_unstable_v1_close(stream);
-        stream = nullptr;
+      if (zkde_screencast_stream) {
+        zkde_screencast_stream_unstable_v1_close(zkde_screencast_stream);
+        zkde_screencast_stream = nullptr;
       }
 
       if (zkde_screencast) {
@@ -193,14 +192,14 @@ namespace kwin {
       }
       outputs.clear();
 
-      if (registry) {
-        wl_registry_destroy(registry);
-        registry = nullptr;
+      if (wl_registry) {
+        wl_registry_destroy(wl_registry);
+        wl_registry = nullptr;
       }
 
-      if (display) {
-        wl_display_disconnect(display);
-        display = nullptr;
+      if (wl_display) {
+        wl_display_disconnect(wl_display);
+        wl_display = nullptr;
       }
     }
 
@@ -220,15 +219,15 @@ namespace kwin {
         return -1;
       }
 
-      display = wl_display_connect(wl_name);
-      if (!display) {
+      wl_display = wl_display_connect(wl_name);
+      if (!wl_display) {
         BOOST_LOG(error) << "[kwingrab] cannot connect to Wayland display: "sv << wl_name;
         return -1;
       }
 
-      registry = wl_display_get_registry(display);
-      wl_registry_add_listener(registry, &registry_listener, this);
-      wl_display_roundtrip(display);
+      wl_registry = wl_display_get_registry(wl_display);
+      wl_registry_add_listener(wl_registry, &registry_listener, this);
+      wl_display_roundtrip(wl_display);
 
       if (!zkde_screencast) {
         BOOST_LOG(error) << "[kwingrab] zkde_screencast_unstable_v1 not found in registry. Check "sv
@@ -240,7 +239,7 @@ namespace kwin {
         return -1;
       }
       // We need a second roundtrip after binding outputs to get wl_output events
-      wl_display_roundtrip(display);
+      wl_display_roundtrip(wl_display);
 
       return 0;
     }
@@ -258,7 +257,7 @@ namespace kwin {
 
       std::vector<output_params_t_> output_params_;
       for (int i = 0; i < outputs.size(); i++) {
-        output_params_.emplace_back(i, output_names[i], output_widths[i], output_heights[i], output_x_positions[i], output_y_positions[i], get_order_for_output_name(output_names[i]));
+        output_params_.emplace_back(i, outputs_name[i], outputs_width[i], outputs_height[i], outputs_pos_x[i], outputs_pos_y[i], get_order_for_output_name(outputs_name[i]));
       }
       std::ranges::sort(output_params_, [](const auto &a, const auto &b) {
         return a.order < b.order || a.pos_x < b.pos_x || a.pos_y < b.pos_y;
@@ -277,11 +276,11 @@ namespace kwin {
      * @return 0 on success, -1 on failure. On success, node_id and
      *         output width/height/x/y are populated.
      */
-    int start(const std::string &output_name) {
+    int start(const std::string_view &output_name) {
       int output_index = 0;
       if (!output_name.empty()) {
         for (int i = 0; i < outputs.size(); i++) {
-          if (output_names[i] == output_name) {
+          if (outputs_name[i] == output_name) {
             output_index = i;
             break;
           }
@@ -290,16 +289,16 @@ namespace kwin {
 
       // Request a stream for the chosen output with embedded cursor
       auto *target_output = outputs[output_index];
-      stream = zkde_screencast_unstable_v1_stream_output(zkde_screencast, target_output, CURSOR_EMBEDDED);
-      zkde_screencast_stream_unstable_v1_add_listener(stream, &stream_listener, this);
+      zkde_screencast_stream = zkde_screencast_unstable_v1_stream_output(zkde_screencast, target_output, CURSOR_EMBEDDED);
+      zkde_screencast_stream_unstable_v1_add_listener(zkde_screencast_stream, &stream_listener, this);
 
       // Dispatch until we get created/failed, with a 5s timeout
       auto deadline = std::chrono::steady_clock::now() + 5s;
       while (node_id == 0 && !failed && std::chrono::steady_clock::now() < deadline) {
-        wl_display_flush(display);
+        wl_display_flush(wl_display);
 
         struct pollfd pfd = {};
-        pfd.fd = wl_display_get_fd(display);
+        pfd.fd = wl_display_get_fd(wl_display);
         pfd.events = POLLIN;
 
         auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -309,7 +308,7 @@ namespace kwin {
           break;
         }
 
-        if (poll(&pfd, 1, remaining.count()) > 0 && (pfd.revents & POLLIN) && wl_display_dispatch(display) < 0) {
+        if (poll(&pfd, 1, remaining.count()) > 0 && (pfd.revents & POLLIN) && wl_display_dispatch(wl_display) < 0) {
           BOOST_LOG(error) << "[kwingrab] wl_display_dispatch failed"sv;
           return -1;
         }
@@ -327,10 +326,10 @@ namespace kwin {
       BOOST_LOG(info) << "[kwingrab] stream created, PipeWire node "sv << node_id;
 
       // Get output dimensions from mode events
-      out_width = output_widths[output_index];
-      out_height = output_heights[output_index];
-      out_pos_x = output_x_positions[output_index];
-      out_pos_y = output_y_positions[output_index];
+      out_width = outputs_width[output_index];
+      out_height = outputs_height[output_index];
+      out_pos_x = outputs_pos_x[output_index];
+      out_pos_y = outputs_pos_y[output_index];
 
       if (out_width == 0 || out_height == 0) {
         BOOST_LOG(error) << "[kwingrab] could not determine output dimensions"sv;
@@ -338,7 +337,7 @@ namespace kwin {
       }
 
       BOOST_LOG(info) << "[kwingrab] Screencasting output "sv << output_index
-                      << " name "sv << output_names[output_index]
+                      << " name "sv << outputs_name[output_index]
                       << " position "sv << out_pos_x << "x"sv << out_pos_y
                       << " resolution "sv << out_width << "x"sv << out_height;
       return 0;
@@ -352,30 +351,30 @@ namespace kwin {
 
   private:
     // ─── Wayland objects ───
-    struct wl_display *display = nullptr;
-    struct wl_registry *registry = nullptr;
+    struct wl_display *wl_display = nullptr;
+    struct wl_registry *wl_registry = nullptr;
     struct kde_output_order_v1 *kde_output_order = nullptr;
     struct zkde_screencast_unstable_v1 *zkde_screencast = nullptr;
-    struct zkde_screencast_stream_unstable_v1 *stream = nullptr;
+    struct zkde_screencast_stream_unstable_v1 *zkde_screencast_stream = nullptr;
     std::vector<struct wl_output *> outputs;
-    std::vector<int> output_widths;
-    std::vector<int> output_heights;
-    std::vector<int> output_x_positions;
-    std::vector<int> output_y_positions;
-    std::vector<std::string> output_names;
-    std::vector<std::string> output_order;
+    std::vector<int> outputs_width;
+    std::vector<int> outputs_height;
+    std::vector<int> outputs_pos_x;
+    std::vector<int> outputs_pos_y;
+    std::vector<std::string> outputs_name;
+    std::vector<std::string> outputs_ordered;
     bool failed = false;
     std::string error_msg;
 
     // ─── Misc functions ───
-    int get_order_for_output_name(const std::string &name) const {
-      for (int i = 0; i < output_order.size(); i++) {
-        if (output_order[i] == name) {
+    int get_order_for_output_name(const std::string_view &name) const {
+      for (int i = 0; i < outputs_ordered.size(); i++) {
+        if (outputs_ordered[i] == name) {
           return i;
         }
       }
-      // If nothing matches move output to the end of the list (highest order)
-      return output_order.size();
+      // If nothing matches return list size (to ensure highest order)
+      return outputs_ordered.size();
     }
 
     // ─── Registry listener ───
@@ -397,16 +396,18 @@ namespace kwin {
         );
         BOOST_LOG(info) << "[kwingrab] bound zkde_screencast_unstable_v1 v"sv << bind_ver;
       } else if (!std::strcmp(interface, wl_output_interface.name)) {
+        // Bind version 4 - we need wl_output name for matching
+        uint32_t bind_ver = std::min(version, static_cast<uint32_t>(4));
         auto *output = static_cast<struct wl_output *>(
-          wl_registry_bind(reg, name, &wl_output_interface, std::min(version, static_cast<uint32_t>(4)))
+          wl_registry_bind(reg, name, &wl_output_interface, bind_ver)
         );
         wl_output_add_listener(output, &output_listener, self);
         self->outputs.emplace_back(output);
-        self->output_widths.emplace_back(0);
-        self->output_heights.emplace_back(0);
-        self->output_x_positions.emplace_back(0);
-        self->output_y_positions.emplace_back(0);
-        self->output_names.emplace_back("");
+        self->outputs_width.emplace_back(0);
+        self->outputs_height.emplace_back(0);
+        self->outputs_pos_x.emplace_back(0);
+        self->outputs_pos_y.emplace_back(0);
+        self->outputs_name.emplace_back("");
       }
     }
 
@@ -424,8 +425,8 @@ namespace kwin {
       auto *self = static_cast<screencast_t *>(data);
       for (size_t i = 0; i < self->outputs.size(); i++) {
         if (self->outputs[i] == output) {
-          self->output_x_positions[i] = x;
-          self->output_y_positions[i] = y;
+          self->outputs_pos_x[i] = x;
+          self->outputs_pos_y[i] = y;
           break;
         }
       }
@@ -439,8 +440,8 @@ namespace kwin {
       auto *self = static_cast<screencast_t *>(data);
       for (size_t i = 0; i < self->outputs.size(); i++) {
         if (self->outputs[i] == output) {
-          self->output_widths[i] = width;
-          self->output_heights[i] = height;
+          self->outputs_width[i] = width;
+          self->outputs_height[i] = height;
           break;
         }
       }
@@ -458,7 +459,7 @@ namespace kwin {
       auto *self = static_cast<screencast_t *>(data);
       for (size_t i = 0; i < self->outputs.size(); i++) {
         if (self->outputs[i] == output) {
-          self->output_names[i] = name;
+          self->outputs_name[i] = name;
           break;
         }
       }
@@ -507,7 +508,7 @@ namespace kwin {
     // ─── Output order listener ───
     static void on_output_order_output(void *data, struct kde_output_order_v1 *kde_output_order_v1 [[maybe_unused]], const char *output_name) {
       auto *self = static_cast<screencast_t *>(data);
-      self->output_order.emplace_back(output_name);
+      self->outputs_ordered.emplace_back(output_name);
     }
 
     static void on_output_order_done(void *data [[maybe_unused]], struct kde_output_order_v1 *kde_output_order_v1 [[maybe_unused]]) {
