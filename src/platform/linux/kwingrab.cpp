@@ -557,6 +557,11 @@ namespace platf {
       return nullptr;
     }
 
+    // Drop CAP_SYS_ADMIN so KWin's permission check can see and match the executable
+    if (has_cap_sys_admin()) {
+      drop_cap_sys_admin();
+    }
+
     auto display = std::make_shared<kwin::kwin_t>();
     if (display->init(hwdevice_type, display_name, config)) {
       return nullptr;
@@ -566,6 +571,14 @@ namespace platf {
   }
 
   std::vector<std::string> kwin_display_names() {
+    if (has_cap_sys_admin()) {
+      // We're still in the probing phase of Sunshine startup. Dropping portal security early will break KMS.
+      // Just return a dummy screen for now. Display re-enumeration after encoder probing will yield full result.
+      std::vector<std::string> display_names;
+      display_names.emplace_back("");
+      return display_names;
+    }
+
     const auto screencast = std::make_unique<kwin::screencast_t>();
     if (screencast->init() < 0) {
       BOOST_LOG(warning) << "[kwingrab] KWin ScreenCast protocol not available."sv;
