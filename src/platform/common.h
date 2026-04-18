@@ -900,4 +900,15 @@ namespace platf {
    */
   std::unique_ptr<high_precision_timer> create_high_precision_timer();
 
+  /**
+   * @brief Check is the current process is running with system admin capabilities
+   * @return True if system admin capabilities are present.
+   */
+  bool has_cap_sys_admin();
+
+  /**
+   * @brief Drop system admin capabilities
+   */
+  void drop_cap_sys_admin();
+
 }  // namespace platf

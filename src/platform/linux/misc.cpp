@@ -25,6 +25,10 @@
 #include <sys/resource.h>  // For setpriority
 #include <sys/socket.h>
 
+#if !defined(__FreeBSD__)
+  #include <sys/capability.h>
+  #include <sys/prctl.h>
+#endif
 #ifdef __FreeBSD__
   #include <net/if_dl.h>  // For sockaddr_dl, LLADDR, and AF_LINK
   #include <sys/syscall.h>  // For syscall: SYS_thr_self
@@ -1226,4 +1230,58 @@ namespace platf {
     return detected.empty() ? "/dev/dri/renderD128" : detected;
   }
 
+  bool has_cap_sys_admin() {
+#if !defined(__FreeBSD__)
+    const cap_t caps = cap_get_proc();
+    if (!caps) {
+      BOOST_LOG(error) << "[misc] has_cap_sys_admin failed to get process capabilities. Assuming true."sv;
+      return true;
+    }
+    cap_flag_value_t cap_flags_value;
+    cap_get_flag(caps, CAP_SYS_ADMIN, CAP_EFFECTIVE, &cap_flags_value);
+    if (cap_flags_value == CAP_SET) {
+      BOOST_LOG(debug) << "[misc] has_cap_sys_admin found effective CAP_SYS_ADMIN. Returning true."sv;
+      return true;
+    }
+    cap_get_flag(caps, CAP_SYS_ADMIN, CAP_PERMITTED, &cap_flags_value);
+    if (cap_flags_value == CAP_SET) {
+      BOOST_LOG(debug) << "[misc] has_cap_sys_admin found permitted CAP_SYS_ADMIN. Returning true."sv;
+      return true;
+    }
+#endif
+    BOOST_LOG(debug) << "[misc] has_cap_sys_admin has not found CAP_SYS_ADMIN. Returning false."sv;
+    return false;
+  }
+
+  void drop_cap_sys_admin() {
+#if !defined(__FreeBSD__)
+    bool failed = false;
+    const cap_t caps = cap_get_proc();
+    if (!caps) {
+      BOOST_LOG(error) << "[misc] drop_cap_sys_admin failed to get process capabilities"sv;
+      return;
+    }
+
+    constexpr std::array<cap_value_t, 2> effective_list {CAP_SYS_ADMIN, CAP_SYS_NICE};
+    constexpr std::array<cap_value_t, 2> permitted_list {CAP_SYS_ADMIN, CAP_SYS_NICE};
+
+    cap_set_flag(caps, CAP_EFFECTIVE, effective_list.size(), effective_list.data(), CAP_CLEAR);
+    cap_set_flag(caps, CAP_PERMITTED, permitted_list.size(), permitted_list.data(), CAP_CLEAR);
+
+    if (cap_set_proc(caps) != 0) {
+      BOOST_LOG(error) << "[misc] drop_cap_sys_admin failed to prune capabilities: "sv << std::strerror(errno);
+      failed = true;
+    }
+    cap_free(caps);
+
+    // Reset dumpable AFTER the caps have been pruned to ensure /proc/pid/root is accessible.
+    if (prctl(PR_SET_DUMPABLE, 1) != 0) {
+      BOOST_LOG(error) << "[misc] drop_cap_sys_admin failed to set PR_SET_DUMPABLE: "sv << std::strerror(errno);
+      failed = true;
+    }
+    if (!failed) {
+      BOOST_LOG(info) << "[misc] drop_cap_sys_admin succeeded in dropping capabilities"sv;
+    }
+#endif
+  }
 }  // namespace platf
