@@ -12,9 +12,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cstring>
 #include <fstream>
 #include <memory>
+#include <pwd.h>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -48,12 +48,123 @@ using namespace std::literals;
 extern const wl_interface wl_output_interface;
 
 namespace kwin {
+  // ─── KWin Wayland ScreenCast permissions ──────────────────────────────────────────────
+  //
+  // To have access to zkde_screencast_unstable_v1 KWin checks for a .desktop file with
+  // X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1 and the current executable name
+  // in the Exec= parameter.
+  class screencast_permission_helper_t {
+  public:
+    static void setup() {
+      if (initialized) {
+        return;
+      }
+      auto user_application_path = get_xdg_user_applications_path();
+      auto executable_path = get_executable_full_path();
+      auto filenameprefix = std::format("{}-kwin-wayland-permission", PROJECT_FQDN);
+      auto full_filenameprefix = (user_application_path / filenameprefix).string();
+      auto file = std::format("{}-{}.desktop", full_filenameprefix, std::chrono::steady_clock::now().time_since_epoch());
+
+      // List existing files for prefix and check if they contain this executable or remove them
+      bool create_file = true;
+      for (const auto &path : std::filesystem::directory_iterator(user_application_path)) {
+        const auto entry = path.path().string();
+        if (entry.starts_with(full_filenameprefix)) {
+          auto entry_executable = get_exec_from_file(entry);
+          if (!entry_executable.empty() && entry_executable == executable_path.string()) {
+            // This entry is exactly the one we need
+            BOOST_LOG(debug) << "[kwingrab] Ignoring current temporary KWin wayland permission file: "sv << entry;
+            create_file = false;
+            continue;
+          }
+          if (!entry_executable.empty() && std::filesystem::exists(entry_executable)) {
+            // This entry is for another sunshine executable that still exists
+            BOOST_LOG(debug) << "[kwingrab] Ignoring other valid temporary KWin wayland permission file: "sv << entry;
+            continue;
+          }
+          if (std::filesystem::remove(path)) {
+            BOOST_LOG(info) << "[kwingrab] Removed stale temporary KWin wayland permission file: "sv << entry << " executable: "sv << entry_executable;
+          } else {
+            BOOST_LOG(warning) << "[kwingrab] Failed to remove stale temporary KWin wayland permission file: "sv << entry << " executable: "sv << entry_executable;
+          }
+        }
+      }
+
+      // Write new file if necessary
+      if (create_file) {
+        std::ofstream filestream(file);
+        if (filestream.is_open()) {
+          filestream << "[Desktop Entry]" << std::endl
+                     << "Exec=" << executable_path.string() << std::endl
+                     << "X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1" << std::endl
+                     << "Type=Application" << std::endl
+                     << "Name="sv << PROJECT_FQDN << "-kwin-wayland-permission" << std::endl
+                     << "Comment=Sunshine KWin screencast permission for " << std::endl
+                     << "NoDisplay=true" << std::endl;
+          BOOST_LOG(info) << "[kwingrab] Created temporary KWin wayland permission file: "sv << file;
+          filestream.close();
+          // Give KWin enough time to catch up with the new desktop file
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          initialized = true;
+        } else {
+          BOOST_LOG(warning) << "[kwingrab] Failed to open temporary KWin wayland permission file: "sv << file;
+        }
+      }
+    }
+
+  private:
+    static inline bool initialized = false;
+
+    static std::filesystem::path get_xdg_user_applications_path() {
+      // This implemented similiar misc.cpp's appdata() but provides the path for
+      // $XDG_DATA_HOME/applications/{PROJECT_FQDN}-kwin-wayland-permission.desktop instead.
+      std::filesystem::path xdg_data_home;
+      const char *homedir;
+      // Get the home directory
+      if ((homedir = getenv("HOME")) == nullptr || strlen(homedir) == 0) {
+        // If HOME is empty or not set, use the current user's home directory
+        homedir = getpwuid(geteuid())->pw_dir;
+      }
+      // Follow the XDG base directory specification for user data home:
+      // https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
+      if (const char *dir; (dir = getenv("XDG_DATA_HOME")) != nullptr && strlen(dir) > 0) {
+        xdg_data_home = std::filesystem::path(dir);
+      } else {
+        xdg_data_home = std::filesystem::path(homedir) / ".local"sv / "share"sv;
+      }
+      return xdg_data_home / "applications";
+    }
+
+    static std::filesystem::path get_executable_full_path() {
+      // Adapted from https://linuxvox.com/blog/how-do-i-find-the-location-of-the-executable-in-c/
+      char exe_path[PATH_MAX];  // PATH_MAX is defined in limits.h (e.g., 4096 on Linux)
+      ssize_t len;
+      // Read the symlink /proc/self/exe into exe_path
+      len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+      if (len == -1) {
+        return "";
+      }
+      return std::string(exe_path, len);
+    }
+
+    static std::string get_exec_from_file(const std::filesystem::path &path) {
+      if (std::ifstream file(path); file.is_open()) {
+        std::string line;
+        while (std::getline(file, line)) {
+          if (line.starts_with("Exec=") && line.length() > 5) {
+            return line.substr(5);
+          }
+        }
+      }
+      return "";
+    }
+  };
+
   // ─── Wayland ScreenCast session ──────────────────────────────────────────────
   //
   // Owns its own wl_display connection. Binds zkde_screencast_unstable_v1
   // and wl_output from the registry, then calls stream_output() to start
   // a ScreenCast. Waits for the created(node_id) event from KWin.
-
   class screencast_t {
   public:
     screencast_t &operator=(screencast_t &&) = delete;  // Do not allow to copying
@@ -90,6 +201,9 @@ namespace kwin {
      *         output width/height/x/y are populated.
      */
     int init() {
+      // Try to setup permissions for zkde_screencast_unstable_v1
+      screencast_permission_helper_t::setup();
+
       const char *wl_name = std::getenv("WAYLAND_DISPLAY");
       if (!wl_name) {
         BOOST_LOG(error) << "[kwingrab] WAYLAND_DISPLAY not set"sv;
@@ -107,8 +221,8 @@ namespace kwin {
       wl_display_roundtrip(display);
 
       if (!screencast) {
-        BOOST_LOG(error) << "[kwingrab] zkde_screencast_unstable_v1 not found in registry. "
-                            "Is KWIN_WAYLAND_NO_PERMISSION_CHECKS=1 set?"sv;
+        BOOST_LOG(error) << "[kwingrab] zkde_screencast_unstable_v1 not found in registry. Check "sv
+                            "desktop file for sunshine binary or set KWIN_WAYLAND_NO_PERMISSION_CHECKS=1"sv;
         return -1;
       }
       if (outputs.empty()) {
