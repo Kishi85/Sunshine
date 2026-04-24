@@ -28,6 +28,7 @@
 
 // generated protocol header
 #include <kde-output-order-v1.h>
+#include <kde-screencast-v2.h>
 #include <zkde-screencast-unstable-v1.h>
 
 // local includes
@@ -117,7 +118,8 @@ namespace kwin {
         if (filestream.is_open()) {
           filestream << "[Desktop Entry]" << std::endl
                      << "Exec=" << executablepath << std::endl
-                     << "X-KDE-Wayland-Interfaces=zkde_screencast_unstable_v1" << std::endl
+                     // TODO: Check we're using the correct interface for v2 here, also update packaging/linux/dev.lizardbyte.app.Sunshine.kwin.desktop.in
+                     << "X-KDE-Wayland-Interfaces=kde_screencast_manger_v2,zkde_screencast_unstable_v1" << std::endl
                      << "Type=Application" << std::endl
                      << "Name="sv << PROJECT_FQDN << "-kwin-wayland-permission" << std::endl
                      << "Comment=Sunshine KWin screencast permission" << std::endl
@@ -256,10 +258,18 @@ namespace kwin {
         zkde_screencast_stream_unstable_v1_close(zkde_screencast_stream);
         zkde_screencast_stream = nullptr;
       }
-
       if (zkde_screencast) {
         zkde_screencast_unstable_v1_destroy(zkde_screencast);
         zkde_screencast = nullptr;
+      }
+
+      if (kde_screencast_stream_v2_) {
+        kde_screencast_stream_v2_destroy(kde_screencast_stream_v2_);
+        kde_screencast_stream_v2_ = nullptr;
+      }
+      if (kde_screencast_manger_v2_) {
+        kde_screencast_manager_v2_destroy(kde_screencast_manger_v2_);
+        kde_screencast_manger_v2_ = nullptr;
       }
 
       if (kde_output_order) {
@@ -358,17 +368,6 @@ namespace kwin {
      *         output width/height/x/y are populated.
      */
     int start(const std::string_view &output_name) {
-      // Check if KDE screencast protocol is available
-      if (!zkde_screencast) {
-        if (screencast_permission_helper_t::is_newly_initialized()) {
-          BOOST_LOG(error) << "[kwingrab] zkde_screencast_unstable_v1 not found in registry. "sv
-                              "A new permission desktop file was automatically created but might now have been recognized yet. Try restarting."sv;
-        } else {
-          BOOST_LOG(error) << "[kwingrab] zkde_screencast_unstable_v1 not found in registry. Check permission "sv
-                              "desktop file for sunshine binary or set KWIN_WAYLAND_NO_PERMISSION_CHECKS=1"sv;
-        }
-        return -1;
-      }
       if (outputs.empty()) {
         BOOST_LOG(error) << "[kwingrab] no wl_output found"sv;
         return -1;
@@ -391,8 +390,27 @@ namespace kwin {
       }
 
       // Request a stream for the chosen output with embedded cursor
-      zkde_screencast_stream = zkde_screencast_unstable_v1_stream_output(zkde_screencast, output, ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_EMBEDDED);
-      zkde_screencast_stream_unstable_v1_add_listener(zkde_screencast_stream, &stream_listener, this);
+      if (kde_screencast_manger_v2_) {
+        const auto kde_screencast_output_params_v2_ = kde_screencast_manager_v2_stream_output(kde_screencast_manger_v2_, out_params->name.c_str());
+        kde_screencast_output_params_v2_set_pointer_mode(kde_screencast_output_params_v2_, KDE_SCREENCAST_MANAGER_V2_POINTER_MODE_EMBEDDED);
+        kde_screencast_stream_v2_ = kde_screencast_output_params_v2_create_stream(kde_screencast_output_params_v2_);
+        kde_screencast_stream_v2_add_listener(kde_screencast_stream_v2_, &stream_v2_listener, this);
+        // TODO: Not sure if we have to cleanup here because kde_screencast_output_params_v2_create_stream is already marked as a destructor in protocol. Needs testing...
+        kde_screencast_output_params_v2_destroy(kde_screencast_output_params_v2_);
+      } else if (zkde_screencast) {
+        zkde_screencast_stream = zkde_screencast_unstable_v1_stream_output(zkde_screencast, output, ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_EMBEDDED);
+        zkde_screencast_stream_unstable_v1_add_listener(zkde_screencast_stream, &stream_listener, this);
+      } else {
+        // No screencast protocol found. Output a matching error.
+        if (screencast_permission_helper_t::is_newly_initialized()) {
+          BOOST_LOG(error) << "[kwingrab] zkde_screencast_unstable_v1/kde_screencast_manger_v2 not found in registry. "sv
+                              "A new permission desktop file was automatically created but might now have been recognized yet. Try restarting."sv;
+          return -1;
+        }
+        BOOST_LOG(error) << "[kwingrab] zkde_screencast_unstable_v1/kde_screencast_manger_v2 not found in registry. Check permission "sv
+                            "desktop file for sunshine binary or set KWIN_WAYLAND_NO_PERMISSION_CHECKS=1"sv;
+        return -1;
+      }
 
       // Dispatch until we get created/failed, with a 5s timeout
       auto deadline = std::chrono::steady_clock::now() + 5s;
@@ -447,6 +465,8 @@ namespace kwin {
     struct wl_display *wl_display = nullptr;
     struct wl_registry *wl_registry = nullptr;
     struct kde_output_order_v1 *kde_output_order = nullptr;
+    struct kde_screencast_manager_v2 *kde_screencast_manger_v2_ = nullptr;
+    struct kde_screencast_stream_v2 *kde_screencast_stream_v2_ = nullptr;
     struct zkde_screencast_unstable_v1 *zkde_screencast = nullptr;
     struct zkde_screencast_stream_unstable_v1 *zkde_screencast_stream = nullptr;
     std::map<struct wl_output *, std::shared_ptr<output_parameter_t>> outputs;
@@ -476,6 +496,13 @@ namespace kwin {
         );
         kde_output_order_v1_add_listener(self->kde_output_order, &output_order_listener, self);
         BOOST_LOG(debug) << "[kwingrab] bound kde_output_order_v1 v"sv << bind_ver;
+      } else if (!std::strcmp(interface, kde_screencast_manager_v2_interface.name)) {
+        // Bind version 1 — we only use stream_output which is v1
+        uint32_t bind_ver = std::min(version, static_cast<uint32_t>(1));
+        self->kde_screencast_manger_v2_ = static_cast<struct kde_screencast_manager_v2 *>(
+          wl_registry_bind(reg, name, &kde_screencast_manager_v2_interface, bind_ver)
+        );
+        BOOST_LOG(debug) << "[kwingrab] bound kde_screencast_manager_v2 v"sv << bind_ver;
       } else if (!std::strcmp(interface, zkde_screencast_unstable_v1_interface.name)) {
         // Bind version 1 — we only use stream_output which is v1
         uint32_t bind_ver = std::min(version, static_cast<uint32_t>(1));
@@ -595,6 +622,34 @@ namespace kwin {
     static constexpr kde_output_order_v1_listener output_order_listener = {
       .output = on_output_order_output,
       .done = on_output_order_done,
+    };
+
+    // ─── ScreenCast stream listener v2 ───
+    static void on_stream_v2_closed(void *data, struct kde_screencast_stream_v2 *stream [[maybe_unused]]) {
+      auto *self = static_cast<screencast_t *>(data);
+      BOOST_LOG(warning) << "[kwingrab] stream closed by server"sv;
+      self->stream_failed = true;
+      self->stream_error_msg = "stream closed by server";
+    }
+
+    static void on_stream_v2_created(void *data, struct kde_screencast_stream_v2 *stream [[maybe_unused]], const uint32_t node, const uint32_t object_serial_high [[maybe_unused]], const uint32_t object_serial_low [[maybe_unused]]) {
+      auto *self = static_cast<screencast_t *>(data);
+      // Continue to use deprecated pipewire node_id for now (XDG portal relies on it so it won't go anywhere for a while) and is still provided for compatibility reasons.
+      self->out_node_id = node;
+      BOOST_LOG(debug) << "[kwingrab] created event, node_id="sv << node;
+    }
+
+    static void on_stream_v2_failed(void *data, struct kde_screencast_stream_v2 *stream [[maybe_unused]], const char *err_msg) {
+      auto *self = static_cast<screencast_t *>(data);
+      self->stream_failed = true;
+      self->stream_error_msg = err_msg ? err_msg : "unknown error";
+      BOOST_LOG(error) << "[kwingrab] failed event: "sv << self->stream_error_msg;
+    }
+
+    static constexpr struct kde_screencast_stream_v2_listener stream_v2_listener = {
+      .closed = on_stream_v2_closed,
+      .created = on_stream_v2_created,
+      .failed = on_stream_v2_failed,
     };
   };
 
