@@ -457,7 +457,8 @@ namespace kwin {
       return 0;
     }
 
-    uint32_t out_node_id = 0;
+    uint32_t out_node_id = PW_ID_ANY;
+    uint64_t out_object_serial = SPA_ID_INVALID;
     std::shared_ptr<output_parameter_t> out_params = nullptr;
 
   private:
@@ -632,11 +633,11 @@ namespace kwin {
       self->stream_error_msg = "stream closed by server";
     }
 
-    static void on_stream_v2_created(void *data, struct kde_screencast_stream_v2 *stream [[maybe_unused]], const uint32_t node, const uint32_t object_serial_high [[maybe_unused]], const uint32_t object_serial_low [[maybe_unused]]) {
+    static void on_stream_v2_created(void *data, struct kde_screencast_stream_v2 *stream [[maybe_unused]], const uint32_t node, const uint32_t object_serial_high, const uint32_t object_serial_low) {
       auto *self = static_cast<screencast_t *>(data);
-      // Continue to use deprecated pipewire node_id for now (XDG portal relies on it so it won't go anywhere for a while) and is still provided for compatibility reasons.
       self->out_node_id = node;
-      BOOST_LOG(debug) << "[kwingrab] created event, node_id="sv << node;
+      self->out_object_serial = static_cast<uint64_t>(object_serial_high) << 32 | object_serial_low;
+      BOOST_LOG(debug) << "[kwingrab] created event, node="sv << node << " object_serial="sv << self->out_object_serial;
     }
 
     static void on_stream_v2_failed(void *data, struct kde_screencast_stream_v2 *stream [[maybe_unused]], const char *err_msg) {
@@ -659,7 +660,7 @@ namespace kwin {
 
   class kwin_t: public pipewire::pipewire_display_t {
   public:
-    int configure_stream(const std::string &display_name, int &out_pipewire_fd, uint32_t &out_pipewire_node, uint64_t &out_pipewire_object_serial [[maybe_unused]]) override {
+    int configure_stream(const std::string &display_name, int &out_pipewire_fd, uint32_t &out_pipewire_node, uint64_t &out_pipewire_object_serial) override {
       screencast = std::make_unique<screencast_t>();
       if (screencast->init(true) < 0) {
         return -1;
@@ -671,6 +672,7 @@ namespace kwin {
         // Return values for pipewire init
         out_pipewire_fd = -1;  // KWin screencast capture runs on the local pipewire core
         out_pipewire_node = screencast->out_node_id;
+        out_pipewire_object_serial = screencast->out_object_serial;
         // Set/update basic stream parameters on display_t
         this->offset_x = screencast->out_params->pos_x;
         this->offset_y = screencast->out_params->pos_y;
