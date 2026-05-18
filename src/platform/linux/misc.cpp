@@ -1129,7 +1129,8 @@ namespace platf {
     set_env("AMD_DEBUG", "lowlatencyenc");
 
     // enable Vulkan video extensions for AMD RADV
-    set_env("RADV_PERFTEST", "video_encode");
+    set_env("RADV_PERFTEST", "video_encode");  // Deprecated as of Mesa 26.1
+    set_env("RADV_EXPERIMENTAL", "video_encode");  // New parameter as of Mesa 26.1
 
     // These are allowed to fail.
     gbm::init();
