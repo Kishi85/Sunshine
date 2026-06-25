@@ -38,6 +38,16 @@ namespace safe {
       _cv.notify_all();
     }
 
+    status_t try_pop() {
+      std::lock_guard lg {_lock};
+      if (!_status) {
+        return util::false_v<status_t>;
+      }
+      auto val = std::move(_status);
+      _status = util::false_v<status_t>;
+      return val;
+    }
+
     // pop and view should not be used interchangeably
     status_t pop() {
       std::unique_lock ul {_lock};
@@ -72,7 +82,7 @@ namespace safe {
       }
 
       auto val = std::move(_status);
-      _status.reset();
+      _status = util::false_v<status_t>;
       return val;
     }
 
